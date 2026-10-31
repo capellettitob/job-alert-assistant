@@ -1,0 +1,31 @@
+{
+  "profile": {
+    "skills": ["spreadsheet", "data cleanup", "dashboard", "python", "reporting"],
+    "avoid": ["adult", "gambling", "unpaid trial"]
+  },
+  "rules": {
+    "min_skill_matches": 1,
+    "min_budget": { "fixed": 100, "hourly": 20 },
+    "max_proposals": 15,
+    "min_client_rating": 4.5,
+    "weights": { "job_type": 3, "budget": 2, "competition": 2, "client_rating": 1 },
+    "min_score_to_ping": 0.6
+  },
+  "allowed_link_hosts": ["www.upwork.com", "upwork.com"],
+  "llm": {
+    "enabled": false,
+    "provider": "anthropic",
+    "model": "claude-opus-5-5",
+    "min_confidence": 95,
+    "max_llm_calls_per_day": 40,
+    "timeout_seconds": 10,
+    "draft_max_chars": 900,
+    "disclosure_line": "AI helped me draft this reply. I read and check every detail myself.",
+    "portfolio": [
+      { "title": "Sales report dashboard", "summary": "Built a weekly sales dashboard in a spreadsheet from raw CSV exports, with charts and a one-page summary." },
+      { "title": "Customer list cleanup", "summary": "Cleaned and merged three inconsistent customer spreadsheets into one deduplicated sheet with a short change log." },
+      { "title": "Small reporting script", "summary": "Wrote a short Python script that turns a daily CSV export into a formatted report file." }
+    ]
+  },
+  "draft_template": "Hello,\n\nI read your post \"$title\" and the work looks close to what I do: $skills.\n\nTell me what the finished result should look like and when you need it, and I will confirm the plan and a price.\n\nThanks"
+}
