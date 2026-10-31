@@ -18,7 +18,7 @@
     "model": "claude-opus-5-5",
     "min_confidence": 95,
     "max_llm_calls_per_day": 40,
-    "timeout_seconds": 10,
+    "timeout_seconds": 25,
     "draft_max_chars": 900,
     "disclosure_line": "AI helped me draft this reply. I read and check every detail myself.",
     "portfolio": [

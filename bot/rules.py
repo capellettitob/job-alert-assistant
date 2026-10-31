@@ -5,7 +5,9 @@ Four checks, each with a weight from the config:
   job_type      the post mentions at least N of your profile skills, and none of
                 the words you want to avoid. This one is a gate: without it the
                 job is never pinged, whatever the rest says.
-  budget        the budget reaches your minimum for that payment type.
+  budget        the budget reaches your minimum for that payment type. Also a
+                gate: a known budget under your minimum means no ping. An
+                unknown budget does not block.
   competition   few enough proposals so far.
   client_rating the client's rating reaches your minimum.
 
@@ -15,7 +17,8 @@ Unknown checks are left out of the score instead of counting against the job,
 and the ping says so, so you can look it up yourself.
 
 score = weight of passed checks / weight of known checks, from 0 to 1.
-A job is pinged when the job_type gate passes and score >= min_score_to_ping.
+A job is pinged when the job_type gate passes, the budget gate does not fail,
+and score >= min_score_to_ping.
 
 Standard library only.
 """
@@ -257,6 +260,9 @@ def score_job(job: Job, cfg: Dict[str, Any]) -> Verdict:
     gate = checks[0]
     if gate.status != "pass":
         return Verdict(False, score, checks, matched, "job type: " + gate.detail)
+    budget = checks[1]
+    if budget.status == "fail":   # a known budget under the minimum is a gate too; an unknown one is not
+        return Verdict(False, score, checks, matched, "budget: " + budget.detail)
     if score is not None and score < rules["min_score_to_ping"]:
         return Verdict(False, score, checks, matched, f"score {score:.2f} is under {rules['min_score_to_ping']:g}")
     return Verdict(True, score, checks, matched, "")

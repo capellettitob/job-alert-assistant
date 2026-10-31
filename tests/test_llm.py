@@ -12,6 +12,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -446,6 +447,94 @@ class InTheWebhook(QuietStderr):
         self.assertIn("daily limit of 2", self.fake.of("sendMessage")[1]["text"])
 
 
+class RetriesAndLocking(QuietStderr):
+    """A Telegram failure costs no second model call, and model calls never hold up taps or run twice for one job."""
+    JOB = {"id": "~01demojobretry01", "url": "https://example.com/jobs/r", "title": "Spreadsheet cleanup and dashboard",
+           "description": "Clean three sheets.", "payment": "fixed", "budget": 400}
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "state.json")
+        self.fake = FakeTelegram()
+
+    def app(self, assistant):
+        return App(CFG, Store(self.path), Telegram(CHAT, self.fake), assistant)
+
+    def test_a_telegram_failure_saves_the_ai_result_and_the_retry_reuses_it(self):
+        a, provider = make_assistant([feas(97, risks=["Dates may differ."]), {"draft": GOOD_DRAFT}], disclosure_line=SAMPLE_LINE)
+        app = self.app(a)
+        self.fake.fail = 1
+        status, out = app.handle_jobs({"jobs": [self.JOB]})
+        self.assertEqual(status, 502)
+        rec = Store(self.path).get(self.JOB["id"])
+        self.assertEqual(rec["status"], "unsent")
+        self.assertEqual(rec["ai"]["confidence"], 97)
+        self.assertEqual(len(provider.calls), 2)
+        restarted = self.app(a)   # a server restarted from the saved state reuses it just the same
+        status, out = restarted.handle_jobs({"jobs": [self.JOB]})
+        self.assertEqual((status, out["pinged"]), (200, [self.JOB["id"]]))
+        self.assertEqual(restarted.handle_jobs({"jobs": [self.JOB]})[1]["duplicates"], 1)
+        self.assertEqual(len(provider.calls), 2, "no second model call for the retry")
+        sends = self.fake.of("sendMessage")
+        self.assertEqual(len(sends), 2, "one failed try, one ping")
+        ping = sends[-1]
+        self.assertIn("AI check: confidence 97 out of 100", ping["text"])
+        self.assertIn("Dates may differ.", ping["text"])
+        self.assertIn(GOOD_DRAFT, ping["text"])
+        self.assertTrue(ping["text"].split("</pre>")[0].endswith(SAMPLE_LINE))
+        self.assertEqual(Store(self.path).get(self.JOB["id"])["status"], "pending")
+
+    def test_an_unknown_ai_check_is_saved_too(self):
+        a, provider = make_assistant([LlmError("the Anthropic API answered HTTP 529 (overloaded_error)")])
+        app = self.app(a)
+        self.fake.fail = 1
+        app.handle_jobs({"jobs": [self.JOB]})
+        app.handle_jobs({"jobs": [self.JOB]})
+        self.assertEqual(len(provider.calls), 1)
+        self.assertIn("AI check: unknown, the Anthropic API answered HTTP 529", self.fake.of("sendMessage")[-1]["text"])
+
+    def test_a_tap_does_not_wait_for_a_slow_model(self):
+        app = self.app(None)
+        app.handle_jobs({"jobs": [dict(self.JOB, id="~01demojobretry02")]})   # a pending job to tap
+        a, provider = make_assistant([feas(97), {"draft": GOOD_DRAFT}], delay=1.0)
+        app.assistant = a
+        worker = threading.Thread(target=app.handle_jobs, args=({"jobs": [self.JOB]},))
+        worker.start()
+        self.addCleanup(worker.join, 5)
+        while not provider.calls:
+            time.sleep(0.01)
+        from tests.test_server import tap
+        start = time.monotonic()
+        app.handle_update(tap("~01demojobretry02", "skip"))
+        self.assertLess(time.monotonic() - start, 0.5, "the tap was answered while the model was still thinking")
+        self.assertEqual(Store(self.path).get("~01demojobretry02")["status"], "skip")
+
+    def test_the_same_job_is_never_worked_on_twice_at_once(self):
+        a, provider = make_assistant([feas(97), {"draft": GOOD_DRAFT}], delay=0.5)
+        app = self.app(a)
+        first = {}
+        worker = threading.Thread(target=lambda: first.update(zip(("status", "out"), app.handle_jobs({"jobs": [self.JOB]}))))
+        worker.start()
+        while not provider.calls:
+            time.sleep(0.01)
+        status, out = app.handle_jobs({"jobs": [self.JOB]})
+        self.assertEqual((status, out["busy"]), (503, [self.JOB["id"]]), "the second post is told to try again")
+        worker.join(5)
+        self.assertEqual((first["status"], first["out"]["pinged"]), (200, [self.JOB["id"]]))
+        self.assertEqual(len(provider.calls), 2)
+        self.assertEqual(len(self.fake.of("sendMessage")), 1)
+        status, out = app.handle_jobs({"jobs": [self.JOB]})
+        self.assertEqual((status, out["duplicates"]), (200, 1), "once it is done, it is a duplicate")
+
+    def test_ai_results_survive_the_round_trip_through_the_state_file(self):
+        from bot.llm import AiResult
+        r = AiResult("pass", "model", 97, True, "why", ["a", "b"], note="", draft="d", draft_note="", min_confidence=95, disclosure="x")
+        self.assertEqual(AiResult.from_dict(json.loads(json.dumps(r.to_dict()))), r)
+        self.assertEqual(AiResult.from_dict(dict(r.to_dict(), unknown_field=1)), r)
+
+
 SAMPLE_LINE = "AI helped me draft this reply. I read and check every detail myself."
 
 
@@ -608,7 +697,8 @@ class Config(unittest.TestCase):
         llm = parse_llm_config(CFG)
         self.assertFalse(llm.enabled)
         self.assertEqual((llm.provider, llm.model, llm.min_confidence), ("anthropic", "claude-opus-5-5", 95))
-        self.assertEqual(llm.timeout, 10.0)
+        self.assertEqual(llm.timeout, 25.0, "the example gives the draft step room")
+        self.assertEqual(parse_llm_config({"llm": {"enabled": False}}).timeout, 10.0, "the code default when it is left out")
 
     def test_bad_values_are_refused(self):
         base = json.loads(json.dumps(CFG["llm"]))

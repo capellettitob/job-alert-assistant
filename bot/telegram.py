@@ -62,7 +62,7 @@ class Telegram:
 
     def post_message(self, text: str, keyboard: Optional[Dict] = None, html: bool = True, silent: bool = False) -> int:
         """Post a message to the chat. Returns the Telegram message id. silent: no sound or buzz."""
-        payload: Dict[str, Any] = {"chat_id": self.chat_id, "text": text, "disable_web_page_preview": True}
+        payload: Dict[str, Any] = {"chat_id": self.chat_id, "text": text, "link_preview_options": {"is_disabled": True}}
         if silent:
             payload["disable_notification"] = True
         if html:
@@ -70,6 +70,10 @@ class Telegram:
         if keyboard:
             payload["reply_markup"] = keyboard
         return int(self._ok("sendMessage", payload)["result"]["message_id"])
+
+    def get_me(self) -> Dict[str, Any]:
+        """Who the bot is. A wrong token fails here."""
+        return self._ok("getMe", {})["result"]
 
     def set_keyboard(self, message_id: int, keyboard: Dict) -> None:
         self._ok("editMessageReplyMarkup", {"chat_id": self.chat_id, "message_id": message_id, "reply_markup": keyboard})

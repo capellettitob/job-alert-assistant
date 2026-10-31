@@ -341,4 +341,128 @@ t('during a run, Gmail only receives list and get calls', () => {
   assert.ok(box.calls.gmail.every((c) => c === 'list' || c.indexOf('get:') === 0), box.calls.gmail.join(','));
 });
 
+// ---------- budget labels ----------
+
+t('a budget is read only after a budget label, never from a client line', () => {
+  const s = sandbox([]).ctx;
+  assert.strictEqual(s.parseBudget('Fixed-price · Intermediate · Est. budget: $300 · Posted 4 minutes ago · Payment verified · $5K+ spent', 'fixed'), 300);
+  assert.strictEqual(s.parseBudget('Hourly: $25.00-$40.00 · Expert · Payment verified · $50K+ spent', 'hourly'), 40);
+  assert.strictEqual(s.parseBudget('Hourly rate $15 to $30', 'hourly'), 30);
+  assert.strictEqual(s.parseBudget('Fixed price: $1,250. Need data cleanup.', 'fixed'), 1250);
+  assert.strictEqual(s.parseBudget('Budget: $1.5K', 'fixed'), 1500);
+  assert.strictEqual(s.parseBudget('Budget – $80', 'fixed'), 80);
+  assert.strictEqual(s.parseBudget('Payment verified · $50K+ spent · Germany', 'hourly'), null, 'a client line is not a budget');
+  assert.strictEqual(s.parseBudget('Fixed-price · Entry level · $200 spent by the client', 'fixed'), null);
+  assert.strictEqual(s.parseBudget('The budget is flexible, we paid $40 last time', 'fixed'), null);
+});
+
+t('in a whole alert the client line never becomes the budget', () => {
+  const html = '<a href="https://www.upwork.com/jobs/~02labelaaaaaaaaaaaaa1">KPI report</a><p>Hourly: $25.00-$40.00</p><p>Payment verified · $50K+ spent</p>' +
+               '<a href="https://www.upwork.com/jobs/~02labelaaaaaaaaaaaaa2">Sheet fix</a><p>Payment verified · $5K+ spent</p><p>Fixed-price · Est. budget: $40</p>';
+  const jobs = sandbox([]).ctx.extractJobs(html);
+  assert.deepStrictEqual(Array.from(jobs, (j) => [j.payment, j.budget]), [['hourly', 40], ['fixed', 40]]);
+});
+
+// ---------- ids anywhere in the email ----------
+
+function plainMessage(id, subject, text) {
+  return { id: id, internalDate: String(Date.now()),
+           payload: { headers: [{ name: 'Subject', value: subject }], mimeType: 'text/plain', body: { data: B64(text) } } };
+}
+
+t('a plain-text alert is read: id from the bare link, title from the subject, budget from its label', () => {
+  const text = 'Excel dashboard for sales data\nFixed-price - Est. budget: $400\nhttps://www.upwork.com/jobs/~02plainaaaaaaaaaaaa1?ref=email\n\nUnsubscribe: https://example.com/u';
+  const box = sandbox([plainMessage('p1', 'New job alert: Excel dashboard for sales data', text)]);
+  box.ctx.tick();
+  const jobs = box.calls.fetch[0].body.jobs;
+  assert.strictEqual(jobs.length, 1);
+  assert.deepStrictEqual([jobs[0].id, jobs[0].url, jobs[0].title, jobs[0].payment, jobs[0].budget],
+    ['~02plainaaaaaaaaaaaa1', 'https://www.upwork.com/jobs/~02plainaaaaaaaaaaaa1', 'Excel dashboard for sales data', 'fixed', 400]);
+  assert.ok('m_p1' in box.store);
+});
+
+t('several jobs in a plain-text alert each get their own block', () => {
+  const text = 'Sheet cleanup\nFixed-price - Budget: $300\nhttps://www.upwork.com/jobs/~02plainbbbbbbbbbbbb1\n\nWeekly report\nHourly: $20-$30\nhttps://evil.example/jobs/~02plainbbbbbbbbbbbb2\n';
+  const jobs = sandbox([]).ctx.extractJobs(text, 'New job alert: Sheet cleanup');
+  assert.deepStrictEqual(Array.from(jobs, (j) => [j.title, j.payment, j.budget, j.url]), [
+    ['Sheet cleanup', 'fixed', 300, 'https://www.upwork.com/jobs/~02plainbbbbbbbbbbbb1'],
+    ['Weekly report', 'hourly', 30, 'https://www.upwork.com/jobs/~02plainbbbbbbbbbbbb2']]);
+});
+
+t('an id outside any link, or hidden as %7E in a tracker, is found with a clean link', () => {
+  const s = sandbox([]).ctx;
+  const bare = s.extractJobs('<p>Job: https://www.upwork.com/jobs/~02bareaaaaaaaaaaaaa1</p><p>Budget: $90</p>', 'New job alert: Bare link job');
+  assert.deepStrictEqual([bare[0].id, bare[0].url, bare[0].title], ['~02bareaaaaaaaaaaaaa1', 'https://www.upwork.com/jobs/~02bareaaaaaaaaaaaaa1', 'Bare link job']);
+  const hidden = s.extractJobs('<a href="https://click.example.net/c?t=https%253A%252F%252Fwww.upwork.com%252Fjobs%252F%257E02hiddenaaaaaaaaaaa1">Hidden job</a>');
+  assert.deepStrictEqual([hidden[0].id, hidden[0].url, hidden[0].title], ['~02hiddenaaaaaaaaaaa1', 'https://www.upwork.com/jobs/~02hiddenaaaaaaaaaaa1', 'Hidden job']);
+});
+
+// ---------- an alert with no job is never marked read in silence ----------
+
+const NO_JOB = '<a href="https://click.example.net/ls/click?upn=u001.b3BhcXVlLXRva2Vu">Inventory spreadsheet audit</a><p>Budget: $250</p>';
+
+t('an alert with no readable job is posted as a note, and marked read only once the webhook took it', () => {
+  const box = sandbox([emailMessage('n1', 'New job alert: Inventory spreadsheet audit', NO_JOB)], { statuses: [500, 200] });
+  box.ctx.tick();
+  assert.strictEqual(box.calls.fetch.length, 1);
+  assert.deepStrictEqual(box.calls.fetch[0].body, { jobs: [], unreadable: [{ id: 'n1', subject: 'New job alert: Inventory spreadsheet audit' }] });
+  assert.ok(!('m_n1' in box.store), 'refused, so not marked');
+  assert.ok(box.calls.log.some((l) => /No job could be read from the alert "New job alert: Inventory spreadsheet audit"/.test(l)), box.calls.log.join('|'));
+  box.ctx.tick();
+  assert.strictEqual(box.calls.fetch.length, 2);
+  assert.ok('m_n1' in box.store);
+  box.ctx.tick();
+  assert.strictEqual(box.calls.fetch.length, 2, 'posted once');
+});
+
+t('jobs and unreadable alerts go in separate posts; an alert whose jobs were all seen is not a note', () => {
+  const box = sandbox([emailMessage('a1', 'New job alert: x', ALERT_HTML), emailMessage('n1', 'New job alert: y', NO_JOB)]);
+  box.ctx.tick();
+  assert.deepStrictEqual(box.calls.fetch.map((c) => [c.body.jobs.length, (c.body.unreadable || []).length]), [[2, 0], [0, 1]]);
+  const again = sandbox([emailMessage('a2', 'New job alert: same jobs again', ALERT_HTML)], { props: Object.assign({}, box.store) });
+  again.ctx.tick();
+  assert.strictEqual(again.calls.fetch.length, 0);
+  assert.ok('m_a2' in again.store);
+});
+
+t('a long subject is cut to 200 characters in the note', () => {
+  const box = sandbox([emailMessage('n2', 'New job alert: ' + 'x'.repeat(400), NO_JOB)]);
+  box.ctx.tick();
+  assert.strictEqual(box.calls.fetch[0].body.unreadable[0].subject.length, 200);
+});
+
+// ---------- https only ----------
+
+t('a WEBHOOK_URL that is not https posts nothing, marks nothing and says why', () => {
+  const box = sandbox([emailMessage('m1', 'New job alert: x', ALERT_HTML)], { props: { WEBHOOK_URL: 'http://hooks.example.com/jobs', API_KEY: KEY } });
+  box.ctx.tick();
+  assert.strictEqual(box.calls.fetch.length, 0);
+  assert.ok(!('m_m1' in box.store));
+  assert.ok(box.calls.log.some((l) => /must start with https/.test(l)));
+  box.ctx.setup();
+  assert.ok(/WEBHOOK_URL \(it must start with https:\/\/\)/.test(box.calls.log[box.calls.log.length - 1]));
+});
+
+// ---------- HTML codes ----------
+
+t('every HTML code in a title is decoded, once', () => {
+  const s = sandbox([]).ctx;
+  assert.strictEqual(s.decodeEntities('Don&rsquo;t &amp; won&#39;t &#8212; caf&eacute; &middot; &#x1F600; &AMP;'), 'Don’t & won\'t — café · \u{1F600} &');
+  assert.strictEqual(s.decodeEntities('&amp;lt;b&amp;gt;'), '&lt;b&gt;', 'decoded once, so it can never become a tag');
+  assert.strictEqual(s.decodeEntities('&nosuchcode; &#0; &#xD800;'), '&nosuchcode; &#0; &#xD800;');
+  assert.strictEqual(s.LATIN1_NAMES.length, 96);
+  const jobs = s.extractJobs('<a href="https://www.upwork.com/jobs/~02codeaaaaaaaaaaaaa1">Client&rsquo;s sheet &ndash; caf&eacute; menu</a>');
+  assert.strictEqual(jobs[0].title, 'Client’s sheet – café menu');
+});
+
+t('diagnose logs every job with its payment type and budget', () => {
+  const box = sandbox([emailMessage('m1', 'New job alert: x', ALERT_HTML), emailMessage('n1', 'New job alert: y', NO_JOB)]);
+  box.ctx.diagnose();
+  const log = box.calls.log.join('\n');
+  assert.ok(/New job alert: x: 2 job\(s\)/.test(log), log);
+  assert.ok(/~01demoaaaaaaaaaa1  fixed  \$1250  Clean up three spreadsheets/.test(log), log);
+  assert.ok(/New job alert: y: 0 job\(s\), so a note would go to Telegram/.test(log), log);
+  assert.strictEqual(box.calls.fetch.length, 0);
+});
+
 console.log(passed + ' watcher tests passed' + (process.exitCode ? ', some FAILED' : ''));

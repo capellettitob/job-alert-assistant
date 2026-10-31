@@ -37,7 +37,7 @@ import time
 import tempfile
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
@@ -516,6 +516,15 @@ class AiResult:
     draft_note: str = ""               # why the template was used, when it was
     min_confidence: int = 95
     disclosure: str = ""               # the disclosure line, when the draft ends with it
+
+    def to_dict(self) -> Dict[str, Any]:
+        """A plain dict for state.json, so a retry can reuse this result without a new model call."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "AiResult":
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
     @property
     def skip_reason(self) -> str:

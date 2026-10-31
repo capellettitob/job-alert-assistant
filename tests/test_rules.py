@@ -197,8 +197,30 @@ class Scoring(unittest.TestCase):
 
     def test_threshold_is_inclusive(self):
         cfg = copy.deepcopy(self.cfg)
-        cfg["rules"]["min_score_to_ping"] = 3 / 8
-        self.assertTrue(score_job(job(budget=10, proposals=40, client_rating=3.0), cfg).ping)
+        cfg["rules"]["min_score_to_ping"] = 5 / 8   # job type and budget pass, competition and rating fail
+        self.assertTrue(score_job(job(proposals=40, client_rating=3.0), cfg).ping)
+
+    def test_a_known_budget_under_the_minimum_is_a_gate(self):
+        # Alert emails rarely give the proposal count or the rating, so job type 3 + budget 2 decide the score:
+        # 3 of 5 = 0.6 used to reach the sample threshold. The gate stops that.
+        v = score_job(job(payment="fixed", budget=40, proposals=None, client_rating=None), self.cfg)
+        self.assertAlmostEqual(v.score, 0.6)
+        self.assertFalse(v.ping)
+        self.assertEqual(v.reason, "budget: 40 fixed is under your minimum of 100")
+        cfg = copy.deepcopy(self.cfg)
+        cfg["rules"]["min_score_to_ping"] = 0
+        self.assertFalse(score_job(job(payment="hourly", budget=5), cfg).ping, "even with no score threshold")
+
+    def test_an_unknown_budget_does_not_block(self):
+        for over in ({"budget": None}, {"payment": None}, {"payment": None, "budget": None}):
+            with self.subTest(over=over):
+                v = score_job(job(proposals=None, client_rating=None, **over), self.cfg)
+                self.assertEqual(self.status(v, "budget"), "unknown")
+                self.assertTrue(v.ping)
+
+    def test_the_job_type_gate_is_checked_before_the_budget_gate(self):
+        v = score_job(job(title="Paint my fence", budget=5), self.cfg)
+        self.assertIn("job type", v.reason)
 
 
 class Draft(unittest.TestCase):

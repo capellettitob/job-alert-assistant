@@ -2,7 +2,8 @@
 
   python3 -m bot serve                 run the webhook
   python3 -m bot set-webhook <url>     tell Telegram where to deliver button taps
-  python3 -m bot check                 check the environment variables and the config
+  python3 -m bot check                 check the environment variables and the config, ask Telegram who the bot
+                                       is and send one test message to your chat
   python3 -m bot score job.json        score one job file offline (no keys needed)
   python3 -m bot llm-check --yes       optional: make real, paid calls to the AI model to test your key and setup
 """
@@ -119,6 +120,12 @@ def main(argv=None) -> int:
     if args.cmd == "check":
         print("environment and config look fine")
         print(f"AI steps: {ai_state}")
+        try:
+            me = tg.get_me()
+            tg.post_message("job-alert-assistant: test message from python3 -m bot check. The bot can write to this chat.", html=False)
+        except TelegramError as err:
+            sys.exit(f"ERROR: Telegram: {err}\nCheck TELEGRAM_BOT_TOKEN, and that TELEGRAM_CHAT_ID is the chat where you wrote to the bot.")
+        print(f"Telegram: the bot @{me.get('username', '?')} answered and one test message was sent to your chat")
         return 0
     if args.cmd == "set-webhook":
         if not args.url.startswith("https://"):

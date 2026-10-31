@@ -3,8 +3,10 @@
 All jobs, names and ids are invented.
 """
 import http.client
+import io
 import json
 import os
+import socket
 import tempfile
 import threading
 import unittest
@@ -112,13 +114,63 @@ class JobsFlow(Base):
         self.assertEqual(self.app.handle_jobs({"jobs": many})[0], 400)
         self.assertEqual(self.fake.calls, [])
 
-    def test_if_telegram_fails_nothing_is_stored_so_a_retry_pings(self):
+    def test_if_telegram_fails_the_draft_is_kept_unsent_and_a_retry_pings_once(self):
         self.fake.fail = 1
         status, out = self.app.handle_jobs({"jobs": [GOOD]})
         self.assertEqual(status, 502)
-        self.assertFalse(self.store.has(GOOD["id"]))
+        self.assertEqual(self.store.get(GOOD["id"])["status"], "unsent")
         status, out = self.app.handle_jobs({"jobs": [GOOD]})
         self.assertEqual((status, out["pinged"]), (200, [GOOD["id"]]))
+        self.assertEqual(self.store.get(GOOD["id"])["status"], "pending")
+        _, out = self.app.handle_jobs({"jobs": [GOOD]})
+        self.assertEqual(out["duplicates"], 1)
+        self.assertEqual(len([p for p in self.fake.of("sendMessage")]), 2, "one failed try, one ping")
+
+    def test_link_previews_are_switched_off_the_current_way(self):
+        self.app.handle_jobs({"jobs": [GOOD]})
+        (ping,) = self.fake.of("sendMessage")
+        self.assertEqual(ping["link_preview_options"], {"is_disabled": True})
+        self.assertNotIn("disable_web_page_preview", ping)
+
+
+class Unreadable(Base):
+    """An alert email with no job the watcher could read: one silent note per email, never lost, never twice."""
+    NOTE = {"id": "18f2a3b4c5d6e7f8", "subject": "New job alert: Inventory spreadsheet audit"}
+
+    def test_a_silent_plain_note_is_posted_once_per_email(self):
+        status, out = self.app.handle_jobs({"jobs": [], "unreadable": [self.NOTE]})
+        self.assertEqual((status, out["noted"]), (200, [self.NOTE["id"]]))
+        (note,) = self.fake.of("sendMessage")
+        self.assertTrue(note["disable_notification"])
+        self.assertNotIn("reply_markup", note)
+        self.assertNotIn("parse_mode", note)
+        self.assertIn("no job could be read from it: New job alert: Inventory spreadsheet audit", note["text"])
+        _, again = self.app.handle_jobs({"jobs": [], "unreadable": [self.NOTE]})
+        self.assertEqual((again["noted"], again["duplicates"]), ([], 1))
+        self.assertEqual(len(self.fake.of("sendMessage")), 1)
+
+    def test_if_telegram_fails_the_watcher_is_told_to_retry(self):
+        self.fake.fail = 1
+        status, _ = self.app.handle_jobs({"jobs": [], "unreadable": [self.NOTE]})
+        self.assertEqual(status, 502)
+        status, out = self.app.handle_jobs({"jobs": [], "unreadable": [self.NOTE]})
+        self.assertEqual((status, out["noted"]), (200, [self.NOTE["id"]]))
+
+    def test_bad_entries_are_refused_and_odd_subjects_are_tidied(self):
+        bad = [{"id": "x y", "subject": "s"}, {"id": "abc"}, {"id": "abc", "subject": "  "}, "nope", {"id": "a" * 65, "subject": "s"}]
+        _, out = self.app.handle_jobs({"jobs": [], "unreadable": bad + [{"id": "abc", "subject": "New job alert:\n\tTwo\x07lines " + "x" * 400}]})
+        self.assertEqual(len(out["invalid"]), len(bad))
+        (note,) = self.fake.of("sendMessage")
+        self.assertIn("New job alert: Two lines xxx", note["text"])
+        self.assertLessEqual(len(note["text"]), 600)
+        self.assertEqual(self.app.handle_jobs({"jobs": [], "unreadable": [self.NOTE] * 21})[0], 400)
+
+    def test_a_note_can_never_be_tapped(self):
+        self.app.handle_jobs({"jobs": [], "unreadable": [self.NOTE]})
+        self.fake.calls.clear()
+        self.app.handle_update(tap("alert:" + self.NOTE["id"], "go"))
+        self.assertEqual(self.fake.of("sendMessage"), [])
+        self.assertEqual(self.fake.of("answerCallbackQuery")[0]["text"], "Unknown button")
 
     def test_state_survives_a_restart(self):
         self.app.handle_jobs({"jobs": [GOOD]})
@@ -269,6 +321,8 @@ class Http(Base):
         h = {"X-Api-Key": API_KEY}
         self.assertEqual(self.request("POST", "/jobs", raw="{not json", headers=h)[0], 400)
         self.assertEqual(self.request("POST", "/jobs", raw="x" * (64 * 1024 + 1), headers=h)[0], 413)
+        with mock.patch("sys.stderr", io.StringIO()):
+            self.assertEqual(self.request("POST", "/jobs", raw="[" * 50000, headers=h)[0], 400, "nested too deeply to read")
 
     def test_health_and_unknown_paths(self):
         self.assertEqual(self.request("GET", "/health"), (200, '{"ok": true}'))
@@ -281,6 +335,24 @@ class Http(Base):
         everything = "\n".join(replies) + json.dumps(self.fake.calls)
         for secret in (API_KEY, HOOK_SECRET, TOKEN):
             self.assertNotIn(secret, everything)
+
+
+class StalledClient(unittest.TestCase):
+    def test_a_client_that_stops_sending_is_cut_off(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        app = App(CFG, Store(os.path.join(tmp.name, "s.json")), Telegram(CHAT, FakeTelegram()))
+        settings = Settings(TOKEN, CHAT, API_KEY, HOOK_SECRET, "config.json", "state.json", "127.0.0.1", 0)
+        with mock.patch("bot.server.READ_TIMEOUT", 0.3), mock.patch("sys.stderr", io.StringIO()):
+            server = make_server(settings, app)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            sock = socket.create_connection(("127.0.0.1", server.server_address[1]), timeout=3)
+            sock.sendall(b"POST /jobs HTTP/1.1\r\nHost: x\r\n")   # and then nothing
+            self.assertEqual(sock.recv(1), b"", "the server closed the connection")
+            sock.close()
+        self.assertEqual(server.RequestHandlerClass.timeout, 0.3)
 
 
 class Secrets(unittest.TestCase):
@@ -315,6 +387,56 @@ class Secrets(unittest.TestCase):
                     transport("sendMessage", {})
                 self.assertNotIn(TOKEN, str(ctx.exception))
                 self.assertNotIn("api.telegram.org", str(ctx.exception))
+
+
+class CheckCommand(unittest.TestCase):
+    """python3 -m bot check: config, environment, then a real round trip to Telegram (faked here)."""
+
+    def run_check(self, transport):
+        from bot import __main__ as cli
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = dict(Secrets.ENV, JAA_CONFIG=os.path.join(ROOT, "config.example.json"), JAA_STATE_FILE=os.path.join(tmp.name, "s.json"))
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch("bot.__main__.http_transport", return_value=transport), \
+                mock.patch("sys.stdout", out):
+            code = cli.main(["check"])
+        return code, out.getvalue()
+
+    def test_it_asks_telegram_who_the_bot_is_and_sends_one_test_message(self):
+        fake = FakeTelegram()
+
+        def transport(method, payload):
+            if method == "getMe":
+                fake.calls.append((method, payload))
+                return {"ok": True, "result": {"username": "example_alert_bot"}}
+            return fake(method, payload)
+
+        code, out = self.run_check(transport)
+        self.assertEqual(code, 0)
+        self.assertEqual([m for m, _ in fake.calls], ["getMe", "sendMessage"])
+        self.assertEqual(fake.of("sendMessage")[0]["chat_id"], CHAT)
+        self.assertIn("test message", fake.of("sendMessage")[0]["text"])
+        self.assertIn("@example_alert_bot", out)
+
+    def test_a_wrong_token_fails_loudly_without_the_token(self):
+        def refuse(method, payload):
+            raise TelegramError(f"{method}: HTTP 401 Unauthorized")
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_check(refuse)
+        self.assertIn("getMe: HTTP 401", str(ctx.exception))
+        self.assertIn("TELEGRAM_BOT_TOKEN", str(ctx.exception))
+        self.assertNotIn(TOKEN, str(ctx.exception))
+
+    def test_a_wrong_chat_fails_loudly(self):
+        def chat_not_found(method, payload):
+            if method == "getMe":
+                return {"ok": True, "result": {"username": "example_alert_bot"}}
+            raise TelegramError("sendMessage: HTTP 400 Bad Request: chat not found")
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_check(chat_not_found)
+        self.assertIn("chat not found", str(ctx.exception))
+        self.assertIn("TELEGRAM_CHAT_ID", str(ctx.exception))
 
 
 class Repository(unittest.TestCase):

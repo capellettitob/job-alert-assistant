@@ -176,6 +176,11 @@ def skip_note(title: str, reason: str) -> str:
     return fit(f"Skipped: {title}. {reason}", 600, lambda s: s)
 
 
+def unreadable_note(subject: str) -> str:
+    """The short plain-text note posted silently when an alert email held no job the watcher could read."""
+    return fit(f"An alert email came in, but no job could be read from it: {subject}. Open it in Gmail to see the job.", 600, lambda s: s)
+
+
 # ---------- buttons ----------
 
 def keyboard(job_id: str) -> Dict:
